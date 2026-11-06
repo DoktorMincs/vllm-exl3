@@ -70,7 +70,11 @@ def install_mixed_k_prescan_guard(exl3_module: Any) -> None:
     if bool(getattr(current, "_vllm_exl3_mixed_k_prescan_guard", False)):
         return
 
-    def guarded(layer: Any, num_experts: int):
+    def guarded(layer: Any, num_experts: int, model_dir: str | None = None):
+        # `model_dir` opcional: `create_weights` passa o diretorio do pack
+        # (vem serializado no quantization_config) para o prescan funcionar em
+        # TODOS os workers, nao so' no rank 0. Sem ele, repassa so' 2 args ao
+        # original, que resolve por env/config.
         placement = _placement_strategy(layer)
         if _eplb_active(layer) or placement not in (None, "linear"):
             logger = getattr(exl3_module, "logger", None)
@@ -82,7 +86,11 @@ def install_mixed_k_prescan_guard(exl3_module: Any) -> None:
                     _eplb_active(layer),
                 )
             return None
-        shapes = current(layer, num_experts)
+        shapes = (
+            current(layer, num_experts, model_dir)
+            if model_dir
+            else current(layer, num_experts)
+        )
         if shapes is None:
             return None
         resolver = getattr(exl3_module, "_resolve_tp_geometry", None)
