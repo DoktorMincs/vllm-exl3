@@ -863,7 +863,8 @@ def _try_prescan_trellis_shapes(
                 shape = tuple(desc.shape)
                 if (desc.dtype != "I16" or len(shape) != 3
                         or any(type(x) is not int or x <= 0 for x in shape)
-                        or shape[-1] % 16 or not 2 <= shape[-1] // 16 <= 8
+                        or shape[-1] % 16 not in (0, 8)
+                        or not 1 <= shape[-1] // 16 <= 8
                         or math.prod(shape) * 2 != desc.nbytes):
                     raise ValueError("invalid EXL3 planned tensor metadata: " + key)
             else:
@@ -1667,9 +1668,10 @@ def assert_exl3_trellis_3d(
             f"EXL3 trellis tile shape {(in_tiles, out_tiles, words)} does "
             f"not cover {in_features}x{out_features} (16-wide tiles)"
         )
-    if words % 16 or not 2 <= words // 16 <= 8:
+    if words % 16 not in (0, 8) or not 1 <= words // 16 <= 8:
         raise ValueError(
-            f"EXL3 trellis width {words} is not 16*K with K in 2..8"
+            f"EXL3 trellis width {words} is not 16*K with K integer or "
+            "half-integer in 1..3.5 / 8"
         )
     return words // 16
 
@@ -2375,6 +2377,33 @@ def _exl3_moe_arity(fn) -> int | None:
     idx = [int(m) for m in re.findall(r"\barg(\d+)\s*:", doc)]
     if idx:
         return max(idx) + 1
+    # pybind11 with explicit py::arg(...) names (the 1.6 bindings do this): the
+    # docstring spells the parameter names instead of arg0/arg1, so count the
+    # top-level parameters of the signature. Without this the arity reads as
+    # None and the K-specialised mixedk tail (k_max + expert_order) is dropped.
+    depth = 0
+    start = cur = None
+    n = 0
+    for i, ch in enumerate(doc):
+        if start is None:
+            if ch == "(":
+                start = cur = i + 1
+                depth = 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth == 0:
+                if doc[cur:i].strip():
+                    n += 1
+                break
+        elif ch == "," and depth == 1:
+            if doc[cur:i].strip():
+                n += 1
+            cur = i + 1
+    if n:
+        return n
     try:
         import inspect
 
@@ -2533,6 +2562,40 @@ def apply_exl3_python_loop(
     return out
 
 
+def _exl3_k_float(words: int) -> float:
+    """EXL3 bitrate K of a trellis tile: ``words = 16 * K`, K integer or half-integer.
+
+    exllamav3 >= 1.5.0 (and the 1.6.x packs) allow the half-integer bitrates
+    1.5 / 2.5 / 3.5 on the mul1 codebook, encoded as a 40- or 24-word tile:
+    16*K words for the integer part plus one extra half-tile of 8 words.
+    """
+    words = int(words)
+    if words <= 0 or words % 16 not in (0, 8):
+        raise ValueError(
+            f"EXL3 trellis width {words} is not 16*K for an integer or "
+            "half-integer K (16, 24, 32, 40, 48, ...)"
+        )
+    return words / 16.0
+
+
+def _exl3_k_bits(words: int) -> int:
+    """Integer part of the bitrate (what MAXBITS/instance selection uses)."""
+    return int(int(words) // 16)
+
+
+def _exl3_k2(words: int) -> int:
+    """Runtime K in HALF-BIT units: ``2 * bits + half`` (see exllamav3 bits_k.cuh).
+
+    This is the convention the fused mixed-K kernel's runtime switch uses since
+    the 1.6 line: cases 2/4/6/... are the integer rates, odd cases are the
+    half-integer ones. Older trees read plain bits here (cases 1..8); the
+    doubled value is what the partiy gate against exllamav3 >= 1.5.0 checks.
+    """
+    words = int(words)
+    _exl3_k_float(words)  # validate
+    return 2 * (words // 16) + (1 if words % 16 else 0)
+
+
 def _assert_mixedk_karrays_match_groups(k_gate, k_up, k_down, k_groups, n_exp, device):
     """Fail closed: the unified kernel's per-expert K arrays and the grouped
     launches' scalar K tuples are two spellings of the same load-time fact, so
@@ -2652,24 +2715,18 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
     layer._exl3_fused_temps = temps
     layer._exl3_fused_concurrency = concurrency
     if mixed_k:
-        # Per-expert K arrays for exl3_moe_mixedk carry the TRUE bit-width K =
-        # trellis.shape[-1] // 16, exactly like the scalar K tuple the grouped
-        # launch passes (below) and the fork engine's own caller
-        # (exllamav3/modules/block_sparse_mlp.py builds them from
-        # LinearEXL3.inner.K). The kernel consumes them as bits: it reads
-        # K_gate_arr[expert_idx] straight into moe_gemm_tile's runtime switch,
-        # whose cases 1..8 are the bits instances -- the same switch the
-        # uniform kernel's true-K scalar feeds
-        # (exllamav3_ext/quant/exl3_moe_kernel.cuh). Commit 3275819 briefly
-        # shipped shape[-1] // 8 = 2*K here ("half-bit units"); the doubled K
-        # selected the wrong bits instance and read past each trellis, which
-        # is the mixedk_unified cosine ~0 of GPU_JOB-2 run 5. (The older
-        # sm_121 illegal-memory-access reports predate this line and had a
-        # different, already-closed cause: the 3f3ed81-era tree already used
-        # // 16 here.)
         layer._exl3_k = None
         layer._exl3_mixedk_unified = True
-        k_gate = (
+        # Per-expert K arrays travel to the fused kernel in HALF-BIT units
+        # (`k2 = 2*bits + half`, exllamav3 bits_k.cuh / k2_from_K) -- the
+        # mixed-K runtime switch's convention since the 1.6 line, where cases
+        # 2/4/6 are the integer rates and 3/5 the halves. Measured 07/11 on
+        # real turbo experts (scripts/frac_mixedk_check.py, production entry
+        # point): K=2.5 -> [5] and [5,6] decode at cos 1.0000/0.9997, while the
+        # plain-bit spelling [2],[2,3] drops to 0.0039 -- the 40-word tile is
+        # then read at the wrong width. The plain-bit spelling is kept
+        # separately for the cross-check against the per-K-group tuples.
+        k_bits_gate = (
             torch.tensor(
                 [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
                 dtype=torch.int32,
@@ -2682,13 +2739,29 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
                 device=device,
             )
         )
-        k_up = torch.tensor(
+        k_bits_up = torch.tensor(
             [int(pack["up"].trellis.shape[-1]) // 16 for pack in inners],
             dtype=torch.int32,
             device=device,
         )
-        k_down = torch.tensor(
+        k_bits_down = torch.tensor(
             [int(pack["down"].trellis.shape[-1]) // 16 for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_gate = torch.tensor(
+            [_exl3_k2(pack["up" if gateless else "gate"].trellis.shape[-1])
+             for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_up = torch.tensor(
+            [_exl3_k2(pack["up"].trellis.shape[-1]) for pack in inners],
+            dtype=torch.int32,
+            device=device,
+        )
+        k_down = torch.tensor(
+            [_exl3_k2(pack["down"].trellis.shape[-1]) for pack in inners],
             dtype=torch.int32,
             device=device,
         )
@@ -2701,14 +2774,23 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
         # pipeline needs) with no device sync and therefore no graph break.
         # max over ALL THREE projections: an expert whose down K exceeds its up K would
         # otherwise select an instance with too few bits cases (__builtin_unreachable).
+        # NOTE: the launcher wants this in BITS and exllamav3 derives it from its own
+        # half-bit arrays as ``(max_k2 + 1) // 2`` -- i.e. a half rate rounds UP
+        # (K = 2.5 -> 3, which takes the generic/mul1-k4 instance). Reproduced exactly
+        # rather than using the tighter floor: the value also sizes the dynamic shared
+        # memory of the low-K instances, and a layer of pure K = 2.5 experts must land
+        # on the same instance the upstream reference would pick.
         layer._exl3_k_max_launch = int(
-            max(
-                int(pack[p].trellis.shape[-1])
-                for pack in inners
-                for p in ("gate", "up", "down")
-                if p in pack
+            (
+                max(
+                    _exl3_k2(pack[p].trellis.shape[-1])
+                    for pack in inners
+                    for p in ("gate", "up", "down")
+                    if p in pack
+                )
+                + 1
             )
-            // 16
+            // 2
         )
         # K-descending expert order (LPT). k_gate/k_up/k_down are per-expert load-time
         # constants, so the permutation and its rank are computed once here and are free
@@ -2739,14 +2821,26 @@ def build_exl3_fused_state(layer: torch.nn.Module, inners: list[dict[str, Any]])
             (k_tuple, ids) for k_tuple, ids in sorted(groups.items())
         ]
         # Fail closed (see _assert_mixedk_karrays_match_groups): the unified
-        # K arrays and the grouped scalar tuples must agree per expert.
+        # K arrays and the grouped scalar tuples must agree per expert. The
+        # arrays are half-bit units, the tuples plain bits, so the check runs
+        # against the plain-bit spelling.
         _assert_mixedk_karrays_match_groups(
-            k_gate, k_up, k_down, layer._exl3_k_groups, n_exp, device
+            k_bits_gate, k_bits_up, k_bits_down, layer._exl3_k_groups, n_exp, device
+        )
+        layer._exl3_has_frac_k = bool(
+            any(int(pack[p].trellis.shape[-1]) % 16 == 8
+                for pack in inners for p in ("gate", "up", "down") if p in pack)
         )
         if len(layer._exl3_k_groups) == 1:
             _kt = layer._exl3_k_groups[0][0]
-            layer._exl3_k_tuple = _kt
-            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
+            # `_exl3_k_tuple` is the UNIFORM launch's scalar K and it is spelled in
+            # plain bits, which cannot express K = 2.5. Leaving it set would send a
+            # uniform frac layer to the batched `exl3_moe` path; None keeps it on the
+            # unified mixedk launch (whose per-expert K arrays carry the half).
+            layer._exl3_k_tuple = None if layer._exl3_has_frac_k else _kt
+            layer._exl3_coop_compat = bool(
+                (not gateless) and _kt[0] == _kt[1] and not layer._exl3_has_frac_k
+            )
         else:
             layer._exl3_k_tuple = None
             layer._exl3_coop_compat = False
@@ -2847,7 +2941,22 @@ def _native_moe_dimensions_supported(
     hidden_meta = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
     inter_meta = int(getattr(layer, "_exl3_intermediate_local", 2048))
     rows = int(x2d.shape[0])
-    bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+    # `_exl3_k` is None on a mixed-K layer (`build_exl3_fused_state` clears it
+    # because the scalar cannot express K=2.5); with `EXL3_FORCE_MIXEDK=1` that
+    # is EVERY layer, and `int(None)` raised inside the try/except of the fused
+    # entry point once per layer per step -- caught and silently downgraded to
+    # the ext path, but paying a Python exception and a stack unwind in the
+    # hottest loop. Fail closed here instead.
+    if getattr(layer, "_exl3_has_frac_k", False):
+        return False
+    k_raw = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))
+    if k_raw is None:
+        return False
+    if isinstance(k_raw, float) and not k_raw.is_integer():
+        # Half-integer bitrates (2.5) have no native decoder: int(2.5) would
+        # silently read the 40-word tile as K=2 and decode garbage.
+        return False
+    bits = int(k_raw)
     if not (
         rows >= 1
         and int(x2d.shape[1]) == hidden_meta == 4096
@@ -2975,7 +3084,13 @@ def _apply_native_fused_moe(
     )
     xh = x2d.to(dtype=torch.float16).contiguous()
     native_out = torch.empty_like(xh)
-    k = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4)))
+    k_raw = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", 4))
+    if k_raw is None or (isinstance(k_raw, float) and not k_raw.is_integer()):
+        # Fail closed: the native ABI has no half-integer decoder, and a
+        # mixed-K layer carries no scalar K at all.
+        layer._exl3_native_error = f"fractional/unset K={k_raw} has no native kernel"
+        return None
+    k = int(k_raw)
     fn = module.p2b_fused_moe
     extra_args = (intermediate, clamp_limit) if extended_abi else ()
     for row in range(int(x2d.shape[0])):
@@ -3477,6 +3592,16 @@ def apply_exl3_fused_moe(
         use_grouped = (k_groups is not None) and (mode != "unified") and (
             mode == "grouped" or grouped_default
         )
+        # The per-group path runs the uniform `exl3_moe`, whose K is an integer
+        # bitrate: a K = 2.5 bucket would be launched as K = 2 and decode the half
+        # tile at the wrong width. Half-integer rates therefore pin the unified
+        # launch, whatever VLLM_EXL3_MIXEDK_MODE says.
+        if getattr(layer, "_exl3_has_frac_k", False) and use_grouped:
+            getattr(logger, "warning_once", logger.warning)(
+                "EXL3 mixed-K: half-integer bitrate present (K=2.5/3.5); grouped "
+                "dispatch cannot carry it -- using the unified exl3_moe_mixedk launch"
+            )
+            use_grouped = False
         # Name the mixed-K dispatch mode once: the serve's receipts and logs
         # must show which kernel family carries production traffic. (Under a
         # real vLLM install the logger carries info_once; the stdlib fallback
@@ -3996,12 +4121,23 @@ class Exl3Config(QuantizationConfig):
         # layers are shaped for their own K and would fail the load shape
         # check under the base K.
         raw_layer_bits = kwargs.pop("layer_bits", None) or {}
-        self.layer_bits: dict[int | str, int] = {
-            (int(k) if isinstance(k, int) or str(k).lstrip("-").isdigit() else str(k)): int(v)
+        def _norm_bits(v: Any) -> Any:
+            """Keep a half-integer bitrate as float; integer rates stay ints.
+
+            The 1.6-line packs (e.g. turboderp 2.68bpw) store routed experts at
+            K=2.5; hidden-integer rates are legal on the mul1 codebook. int()
+            here would silently turn them into K=2 and read the trellis with
+            the wrong width.
+            """
+            f = float(v)
+            return int(f) if f.is_integer() else f
+
+        self.layer_bits: dict[int | str, int | float] = {
+            (int(k) if isinstance(k, int) or str(k).lstrip("-").isdigit() else str(k)): _norm_bits(v)
             for k, v in dict(raw_layer_bits).items()
         }
         for layer_idx, layer_k in self.layer_bits.items():
-            if layer_k not in (2, 3, 4, 5, 6):
+            if layer_k not in (2, 2.5, 3, 3.5, 4, 5, 6):
                 raise ValueError(
                     f"unsupported EXL3 bits={layer_k} for layer {layer_idx}"
                 )
@@ -4923,9 +5059,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     f"expert={expert_id}: got {tuple(sharded.shape)} "
                     f"expected prefix {expect_prefix}+K_words"
                 )
-            if int(sharded.shape[-1]) % 16 != 0:
+            if int(sharded.shape[-1]) % 16 not in (0, 8):
                 raise RuntimeError(
-                    f"EXL3 trellis K_words not multiple of 16: {tuple(sharded.shape)}"
+                    f"EXL3 trellis K_words is not 16*K (integer or half-integer): "
+                    f"{tuple(sharded.shape)}"
                 )
 
             use_arena = _exl3_trellis_arena_enabled()
@@ -5187,6 +5324,9 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         layer._exl3_gateless = gateless
         inners: list[dict[str, Any]] = []
         k_values: list[int] = []
+        # Same widths without the floor: a K = 2.5 tile is 40 words, so
+        # `// 16` above collapses it to 2. Only used to detect the fraction.
+        k_half_values: list[float] = []
         # _BATCHED_MARKERS: prefetch every marker block once (4 host
         # transfers) instead of 6 .item() syncs per expert (288/layer).
         w13_mcg_h = _marker_row_host(layer.w13_mcg)
@@ -5231,6 +5371,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         int(dt.shape[-1]) // 16,
                     ]
                 )
+                k_half_values.extend(
+                    [
+                        int(ut.shape[-1]) / 16.0,
+                        int(dt.shape[-1]) / 16.0,
+                    ]
+                )
                 continue
             gate = make_linear_exl3(
                 gt,
@@ -5261,8 +5407,20 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                     int(dt.shape[-1]) // 16,
                 ]
             )
+            k_half_values.extend(
+                [
+                    int(gt.shape[-1]) / 16.0,
+                    int(ut.shape[-1]) / 16.0,
+                    int(dt.shape[-1]) / 16.0,
+                ]
+            )
         layer._exl3_inners = inners
-        mixed_k = len(set(k_values)) > 1
+        # `// 16` above loses the half of a K = 2.5 tile (40 words); the frac
+        # detection needs the exact width, so it reads `k_half_values`. Layers
+        # of a whole-bit pack never differ between the two views.
+        frac_k = any(float(v) != int(v) for v in k_half_values)
+        layer._exl3_has_frac_k = frac_k
+        mixed_k = len(set(k_values)) > 1 or frac_k
         # A/B LOCAL: EXL3_FORCE_MIXEDK=1 manda tambem as camadas de K uniforme
         # pelo kernel mixedk (K por expert). Motivo (27/10): o kernel uniforme
         # `exl3_moe` bate no K=4 (L3..16) mas produz saida errada no K=3
@@ -5283,8 +5441,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         }
         if len(k_tuples) == 1:
             _kt = next(iter(k_tuples))
-            layer._exl3_k_tuple = _kt
-            layer._exl3_coop_compat = bool((not gateless) and _kt[0] == _kt[1])
+            layer._exl3_k_tuple = None if frac_k else _kt
+            layer._exl3_coop_compat = bool(
+                (not gateless) and _kt[0] == _kt[1] and not frac_k
+            )
         else:
             layer._exl3_k_tuple = None
             layer._exl3_coop_compat = False

@@ -261,7 +261,12 @@ def _install_native_geometry_wrapper(exl3_module: object) -> None:
                 return False
             hidden = int(getattr(layer, "_exl3_hidden_size", x2d.shape[1]))
             intermediate = int(getattr(layer, "_exl3_intermediate_local", 0))
-            bits = int(getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1)))
+            bits = getattr(layer, "_exl3_k", getattr(layer, "_exl3_bits", -1))
+            if isinstance(bits, float) and not bits.is_integer():
+                # Half-integer bitrate: no native decoder, int() would read the
+                # tile with the wrong width.
+                return False
+            bits = int(bits)
             rows = int(x2d.shape[0])
         except (AttributeError, TypeError, ValueError, OverflowError):
             return False

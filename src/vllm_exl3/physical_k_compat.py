@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 
-def _physical_k_values(inners: list[dict[str, Any]]) -> set[int]:
+def _physical_k_values(inners: list[dict[str, Any]]) -> set[int | float]:
     values: set[int] = set()
     for pack in inners:
         gateless = pack.get("gate") is None
@@ -28,12 +28,16 @@ def _physical_k_values(inners: list[dict[str, Any]]) -> set[int]:
                         f"EXL3 fused state cannot determine physical K for {projection}"
                     )
                 words = int(trellis.shape[-1])
-                if words <= 0 or words % 16:
+                if words <= 0 or words % 16 not in (0, 8):
                     raise RuntimeError(
                         f"EXL3 fused state invalid trellis width {words} for {projection}"
                     )
-                k = words // 16
-            values.add(int(k))
+                # /16, não //16: uma tile de 40 palavras é K = 2.5
+                k = words / 16
+            # Keep the exact bitrate: a half-integer rate (2.5) must reach the
+            # kernel as a float. int() here is what silently turned a 40-word
+            # tile into K=2 and decoded the shard with the wrong width.
+            values.add(k if isinstance(k, float) else int(k))
     return values
 
 

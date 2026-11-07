@@ -27,11 +27,17 @@ def _safe_legacy_k(value: object) -> object:
     return 6 if k in (7, 8) else value
 
 
-def _validate_k(value: object, label: str) -> int:
+def _validate_k(value: object, label: str) -> int | float:
     try:
-        k = int(value)  # type: ignore[arg-type]
+        f = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"{label} must be an integer K2-K8, got {value!r}") from exc
+    if not f.is_integer():
+        # Half-integer bitrates 1.5 / 2.5 / 3.5 are legal on the mul1 codebook.
+        if f not in (1.5, 2.5, 3.5):
+            raise ValueError(f"unsupported EXL3 {label}={value!r}; expected K2-K8 or 1.5/2.5/3.5")
+        return f
+    k = int(f)
     if k not in _ALLOWED:
         raise ValueError(f"unsupported EXL3 {label}={k}; expected K2-K8")
     return k
