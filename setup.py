@@ -18,6 +18,12 @@ ext_modules = []
 cmdclass = {}
 
 
+def _cb_flags() -> list[str]:
+    """``-DP2B_CB=<n>`` from VLLM_EXL3_P2B_CB, for every compiler in the build."""
+    cb = os.environ.get("VLLM_EXL3_P2B_CB")
+    return [f"-DP2B_CB={int(cb)}"] if cb else []
+
+
 def _cxx_std():
     """C++ standard for the extension: torch >= 2.14 headers refuse anything below C++20."""
     override = os.environ.get("VLLM_EXL3_CXX_STD")
@@ -76,8 +82,17 @@ if os.environ.get("VLLM_EXL3_NO_CUDA", "0") != "1":
                 ],
                 include_dirs=include_dirs,
                 extra_compile_args={
-                    "cxx": ["-O3", _cxx_std()],
-                    "nvcc": ["-O3", _cxx_std()],
+                    # Expert codebook: 1 = MCG (historical default), 2 = mul1.
+                    # Both DeepSeek-V4.1 packs are mul1, so a build for them
+                    # needs VLLM_EXL3_P2B_CB=2; the extension then exports
+                    # P2B_CB so Python can gate the native path on it instead
+                    # of assuming MCG. It has to go to BOTH compilers: the
+                    # kernels live in .cu (nvcc) but bindings.cpp reports the
+                    # value to Python and is compiled by the host compiler --
+                    # defining it only for nvcc yields a mul1 kernel that
+                    # advertises MCG.
+                    "cxx": ["-O3", _cxx_std()] + _cb_flags(),
+                    "nvcc": ["-O3", _cxx_std()] + _cb_flags(),
                 },
             )
         )

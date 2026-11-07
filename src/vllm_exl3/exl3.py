@@ -217,6 +217,21 @@ MINIMAX_FUSED_LINEAR_MODULES = {
 # from_config in the same process.
 _MINIMAX_M3_PACK_REQUESTED = False
 
+# VLLM_EXL3_MOE_TRACE=1: log one line per MoE layer on its first call, saying
+# which kernel the dispatch actually picked (loop / coop / native / mixed_k)
+# and the facts that decided it. The paths stamp `layer._exl3_last_apply`, but
+# the decision itself is silent, so "is the native kernel even in the path for
+# this pack?" has been answered by inference far too often.
+_MOE_TRACE = os.environ.get("VLLM_EXL3_MOE_TRACE", "0") == "1"
+
+# VLLM_EXL3_P2B_PADDED=1: serve the decode MoE through `p2b_fused_moe_padded`
+# (9 ordinary same-stream launches, zero host sync) instead of the cooperative
+# kernel. The cooperative entry (cudaLaunchCooperativeKernel) is an illegal
+# call inside CUDA graph capture, so this is the only native MoE that can live
+# in the decode graph -- and with EAGER=0 the graph is worth ~7x here. Off by
+# default: it is an A/B arm, gated by scripts/greedy_gate.py.
+_P2B_PADDED = os.environ.get("VLLM_EXL3_P2B_PADDED", "0") == "1"
+
 # Shared fused scratch: decode is sequential across layers.
 _FUSED_TEMP_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _COOP_TEMP_CACHE: dict[tuple, Any] = {}
@@ -3009,6 +3024,20 @@ def _native_moe_max_rows(bits: int) -> int:
 _MCG_CODEBOOK_FLAGS = (True, False) * 3
 
 
+def _native_codebook_flags(module: object) -> tuple[bool, bool]:
+    """``(mcg, mul1)`` the loaded extension was compiled for.
+
+    ``P2B_CB`` is a compile-time switch (1 = MCG, 2 = mul1) and the kernels
+    TORCH_CHECK the caller's ``mcg`` against it. A binary that predates the flag
+    exports nothing, so keep the historical MCG assumption there. Both
+    DeepSeek-V4.1 packs are mul1 (``.mul1`` markers, no ``.mcg``), which is why
+    comparing against a hard-coded MCG tuple disabled the native path for them
+    without a single line in the log.
+    """
+    cb = int(getattr(module, "P2B_CB", 1) or 1)
+    return (cb == 1, cb == 2)
+
+
 def _apply_native_fused_moe(
     x2d: torch.Tensor,
     ids: torch.Tensor,
@@ -3030,12 +3059,21 @@ def _apply_native_fused_moe(
     """
     if getattr(layer, "_exl3_mixed_store", None) is not None:
         return None
-    if getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS) != _MCG_CODEBOOK_FLAGS:
-        return None
     module = _load_native_exl3_ext()
-    if module is None or not _native_moe_dimensions_supported(
+    if module is None:
+        return None
+    # The pack's codebook must match the one this binary was compiled for; the
+    # kernel checks it again, but failing here keeps the cost off the hot path.
+    native_cb = _native_codebook_flags(module)
+    if tuple(getattr(layer, "_exl3_codebook_flags", _MCG_CODEBOOK_FLAGS)) != native_cb * 3:
+        return None
+    if not _native_moe_dimensions_supported(
         x2d, layer, inners, limit
     ):
+        # Stamped for the trace line: without it "the native path never runs"
+        # looks the same whether the codebook, the geometry, the rows cap or
+        # the ABI refused -- and each has a different fix.
+        layer._exl3_native_error = "geometry/rows gate"
         return None
     intermediate = int(getattr(layer, "_exl3_intermediate_local", 2048))
     clamp_limit = float(limit) if limit is not None else 0.0
@@ -3091,6 +3129,56 @@ def _apply_native_fused_moe(
         layer._exl3_native_error = f"fractional/unset K={k_raw} has no native kernel"
         return None
     k = int(k_raw)
+    if _P2B_PADDED and bool(getattr(module, "P2B_MOE_PADDED", False)):
+        # Fixed-shape, all-device entry: one call for the whole decode batch
+        # instead of one cooperative launch per row, and capture-legal. Buffers
+        # are cached per (shape, device) on the layer so a graph replay reuses
+        # the same addresses (a fresh allocation per call would move them).
+        cache = getattr(layer, "_exl3_p2b_cache", None)
+        key = (tuple(xh.shape), xh.dtype, xh.device.index)
+        if cache is None or cache.get("key") != key:
+            cache = {
+                "key": key,
+                "out": torch.empty_like(xh),
+                # n_valid is metadata for the kernel's token guard; the value is
+                # a device fact and must never be read on the host.
+                "n_valid": torch.full((1,), int(xh.shape[0]), dtype=torch.int32,
+                                      device=xh.device),
+                "k": tuple(
+                    torch.full((n_exp,), k, dtype=torch.int8, device=xh.device)
+                    for _ in range(3)
+                ),
+            }
+            layer._exl3_p2b_cache = cache
+        out_p = cache["out"]
+        result = module.p2b_fused_moe_padded(
+            xh,
+            out_p,
+            ptrs["gate_trellis"],
+            ptrs["gate_suh"],
+            ptrs["gate_svh"],
+            ptrs["up_trellis"],
+            ptrs["up_suh"],
+            ptrs["up_svh"],
+            ptrs["down_trellis"],
+            ptrs["down_suh"],
+            ptrs["down_svh"],
+            safe_ids,
+            safe_weights,
+            cache["n_valid"],
+            cache["k"][0],
+            cache["k"][1],
+            cache["k"][2],
+            n_exp,
+            topk,
+            bool(native_cb[0]),
+            intermediate,
+            clamp_limit,
+        )
+        if isinstance(result, torch.Tensor) and result is not out_p:
+            out_p.copy_(result)
+        return out_p
+
     fn = module.p2b_fused_moe
     extra_args = (intermediate, clamp_limit) if extended_abi else ()
     for row in range(int(x2d.shape[0])):
@@ -3111,7 +3199,7 @@ def _apply_native_fused_moe(
             k,
             k,
             k,
-            True,
+            bool(native_cb[0]),
             *extra_args,
         )
         # pybind returns the same output tensor, while lightweight test doubles
@@ -5590,9 +5678,38 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         _alpha, limit = resolve_moe_gate_params(self._gate_param_source(layer))
         del _alpha
         _dump_route(layer, topk_ids, topk_weights, x)
-        return apply_exl3_experts(
+        out = apply_exl3_experts(
             x, topk_ids, topk_weights, layer, limit=limit
         )
+        _rows = int(x.numel() // x.shape[-1])
+        # One line per layer per size class: the first call of a layer is the
+        # prefill/capture pass (hundreds of rows) and it takes a DIFFERENT
+        # branch from decode (a handful of rows), so logging only the first
+        # call answers the wrong question. `_exl3_last_apply` is stamped by the
+        # inner paths with the kernel that actually ran.
+        _cls = "decode" if _rows <= 16 else "prefill"
+        if _MOE_TRACE and _cls not in getattr(layer, "_exl3_trace_done", ()):
+            layer._exl3_trace_done = set(getattr(layer, "_exl3_trace_done", ())) | {_cls}
+            logger.info(
+                "EXL3 MoE trace [%s]: path=%s k=%r k_tuple=%r frac=%s "
+                "mixedk_unified=%s flags=%r rows=%d hidden=%d inter=%d",
+                _cls,
+                getattr(layer, "_exl3_last_apply", None),
+                getattr(layer, "_exl3_k", "<unset>"),
+                getattr(layer, "_exl3_k_tuple", "<unset>"),
+                bool(getattr(layer, "_exl3_has_frac_k", False)),
+                bool(getattr(layer, "_exl3_mixedk_unified", False)),
+                getattr(layer, "_exl3_codebook_flags", "<unset>"),
+                int(x.numel() // x.shape[-1]),
+                int(getattr(layer, "_exl3_hidden_size", 0)),
+                int(getattr(layer, "_exl3_intermediate_local", 0)),
+            )
+            logger.info(
+                "EXL3 MoE trace [%s]: native_err=%r",
+                _cls,
+                getattr(layer, "_exl3_native_error", None),
+            )
+        return out
 
     def _gate_param_source(self, layer):
         # vLLM invokes quant_method.apply(self.moe, ...), so `layer` and

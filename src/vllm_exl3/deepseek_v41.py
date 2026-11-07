@@ -273,7 +273,15 @@ def _install_native_geometry_wrapper(exl3_module: object) -> None:
 
         if not (
             hidden == DEEPSEEK_V41_HIDDEN
-            and intermediate == DEEPSEEK_V41_INTERMEDIATE
+            # `intermediate` here is the PER-RANK width (`_exl3_intermediate_local`),
+            # and plan_deepseek_v41 splits the 2304 intermediate over the TP group
+            # (TP2 -> 1152). Comparing it to the global 2304 rejected every
+            # sharded deployment, so the native p2b kernel could never be
+            # selected here even after the codebook gate was fixed. Accept any
+            # divisor of the global width that still clears the kernel's
+            # 128-multiple geometry check (done below).
+            and intermediate > 0
+            and DEEPSEEK_V41_INTERMEDIATE % intermediate == 0
             and int(x2d.shape[1]) == hidden
             and native_p2b_geometry_supported(hidden, intermediate)
             and bits in (2, 3, 4)

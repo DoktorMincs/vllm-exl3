@@ -10,6 +10,13 @@
 #include "exl3_gemm.cuh"
 #include "exl3_fat_gemm.cuh"
 
+// Expert codebook the kernels were compiled for: 1 = MCG (historical default),
+// 2 = mul1. Same default and meaning as the guard in p2b_moe.cu; the build
+// passes it with -DP2B_CB=2 for mul1 packs (see setup.py's VLLM_EXL3_P2B_CB).
+#ifndef P2B_CB
+#define P2B_CB 1
+#endif
+
 namespace {
 
 at::Tensor dequant_cpu(const at::Tensor& trellis, const at::Tensor& suh,
@@ -255,6 +262,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // p2b_fused_moe_padded rides the same .so; Python gates on the flag and
     // degrades to the per-row mk path when it is absent.
     m.attr("P2B_MOE_PADDED") = true;
+    // Expert codebook this .so was compiled for (1 = MCG, 2 = mul1). It is a
+    // compile-time switch: the kernels instantiate one codebook and the entry
+    // points TORCH_CHECK that the caller's `mcg` matches. Without this flag the
+    // only way for Python to know is to try a call and read the exception --
+    // and the historical gate simply hard-coded MCG, which silently disabled
+    // the native path for every mul1 pack (both DeepSeek-V4.1 packs are mul1:
+    // the trace shows path=batched/coop, never native).
+    m.attr("P2B_CB") = P2B_CB;
+    // Whether the kernels can decode a half-integer K (2.5 -> 40-word tile).
+    // Absent on binaries that predate the half-K decoders.
+#ifdef P2B_MOE_HALF_K
+    m.attr("P2B_MOE_HALF_K") = true;
+#endif
 
     m.def("exl3_fat_gemm", &exl3_fat_gemm, "Native EXL3 fat GEMM for large prefill rows",
           py::arg("a"), py::arg("packed"), py::arg("out"), py::arg("svh"),
