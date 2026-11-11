@@ -135,8 +135,14 @@ def _temp_rows_fused() -> int:
 
 TEMP_ROWS_FUSED = _temp_rows_fused()
 _COOP = os.environ.get("VLLM_EXL3_COOP", "1") == "1"
-_COOP_SLOTS_MAX = 256
-_COOP_ROWS_MAX = 32
+try:
+    _COOP_SLOTS_MAX = max(1, min(512, int(os.environ.get("VLLM_EXL3_COOP_SLOTS_MAX", "512"))))
+except (TypeError, ValueError):
+    _COOP_SLOTS_MAX = 512
+try:
+    _COOP_ROWS_MAX = max(32, min(96, int(os.environ.get("VLLM_EXL3_COOP_ROWS_MAX", "88"))))
+except (TypeError, ValueError):
+    _COOP_ROWS_MAX = 88
 try:
     FAT_EXPERT_THRESHOLD = max(0, int(os.environ.get("VLLM_EXL3_FAT_THRESHOLD", "256")))
 except (TypeError, ValueError):
