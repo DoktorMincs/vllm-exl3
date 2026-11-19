@@ -229,6 +229,8 @@ _MINIMAX_M3_PACK_REQUESTED = False
 # the decision itself is silent, so "is the native kernel even in the path for
 # this pack?" has been answered by inference far too often.
 _MOE_TRACE = os.environ.get("VLLM_EXL3_MOE_TRACE", "0") == "1"
+# One-shot per-process report of the b12x decision inputs (see the loader hook).
+_B12X_PROBE: dict[str, bool] = {}
 
 # VLLM_EXL3_P2B_PADDED=1: serve the decode MoE through `p2b_fused_moe_padded`
 # (9 ordinary same-stream launches, zero host sync) instead of the cooperative
@@ -697,14 +699,24 @@ def _trellis_nbytes(layer: Any) -> int:
             if p is None or int(getattr(p, "numel", lambda: 0)()) == 0:
                 continue
             total += int(p.numel()) * int(p.element_size())
-    # Arenas may be counted twice if we also sum views; prefer arena bytes when present.
+    # Arenas may be counted twice if we also sum views; prefer arena bytes when
+    # present. A joint gate/up arena (b12x) is registered under both projection
+    # lists, so count each backing storage once.
     arena_bytes = 0
+    seen: set[int] = set()
     for aname in (
         "_exl3_gate_trellis_arenas",
         "_exl3_up_trellis_arenas",
         "_exl3_down_trellis_arenas",
     ):
         for arena in getattr(layer, aname, []) or []:
+            try:
+                key = int(arena.untyped_storage().data_ptr())
+            except Exception:
+                key = id(arena)
+            if key in seen:
+                continue
+            seen.add(key)
             arena_bytes += int(arena.numel()) * int(arena.element_size())
     return arena_bytes if arena_bytes else total
 
@@ -1046,6 +1058,25 @@ def prepare_trellis_arena_plan(
         ats_eids = {}
     stats["ats_alias_experts"] = sum(len(v) for v in ats_eids.values())
     stats["ats_alias_bytes"] = ats_alias_bytes
+    # b12x (VLLM_EXL3_MOE_KERNEL=b12x) needs one projection-major
+    # [2,E,H/16,I/16,16*bits]i16 backing for gate+up; two separate per-projection
+    # arenas cannot be viewed that way. Allocate the pair here, once, and keep
+    # the per-expert Parameters as views of it (the EXL3/exllamav3 paths only
+    # dereference the pointers). Anything that does not fit stays per-projection.
+    joint_groups: dict[tuple[int, ...], tuple[list[int], Any]] = {}
+    try:
+        from . import b12x_moe as _b3x
+
+        _joint_wanted = _b3x.plan_joint_w13(layer, shapes_by_proj, ats_eids)
+    except Exception:
+        _joint_wanted = {}
+    for _shape, _eids in _joint_wanted.items():
+        _base = _alloc_trellis_arena(layer, (2, len(_eids), *_shape), dest_device)
+        joint_groups[_shape] = (list(_eids), _base)
+    if joint_groups:
+        layer._exl3_b12x_joint_w13 = {
+            _s: _base for _s, (_e, _base) in joint_groups.items()
+        }
     for proj, plist in proj_to_plist.items():
         by_shape: dict[tuple[int, ...], list[int]] = defaultdict(list)
         for eid, shape in sorted((shapes_by_proj.get(proj) or {}).items()):
@@ -1057,7 +1088,17 @@ def prepare_trellis_arena_plan(
         n_experts = int(len(plist))
         for shape, eids in by_shape.items():
             n = len(eids)
-            arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
+            joint = joint_groups.get(shape) if proj in ("gate", "up") else None
+            if joint is not None and list(joint[0]) == list(eids):
+                # gate and up are the two halves of one projection-major arena.
+                base = joint[1]
+                arena = base[0] if proj == "gate" else base[1]
+                owner = base
+                counts_bytes = proj == "gate"
+            else:
+                arena = _alloc_trellis_arena(layer, (n, *shape), dest_device)
+                owner = arena
+                counts_bytes = True
             meta = {
                 "arena": arena,
                 "eid_to_idx": {eid: i for i, eid in enumerate(eids)},
@@ -1072,12 +1113,18 @@ def prepare_trellis_arena_plan(
                 new_p._exl3_owner = layer
                 plist[eid] = new_p
                 eid_index[proj][eid] = (shape, i)
-            arenas.append(_arena_parameter(arena))
+            arenas.append(_arena_parameter(owner))
             stats["arenas"].setdefault(proj, []).append(
-                {"shape": list(shape), "n": n, "bytes": int(arena.nbytes)}
+                {
+                    "shape": list(shape),
+                    "n": n,
+                    "bytes": int(owner.nbytes) if counts_bytes else 0,
+                    "joint": not counts_bytes,
+                }
             )
-            stats["allocations_after"] += 1
-            stats["final_bytes"] += int(arena.nbytes)
+            if counts_bytes:
+                stats["allocations_after"] += 1
+                stats["final_bytes"] += int(owner.nbytes)
         setattr(layer, proj_to_attr[proj], arenas)
     layer._exl3_trellis_arena_plan = plan
     layer._exl3_trellis_eid_index = eid_index
@@ -2311,13 +2358,14 @@ def _exllamav3_moe_available() -> bool:
 def get_moe_kernel_backend() -> str:
     """Resolve ``VLLM_EXL3_MOE_KERNEL`` to the requested/available backend.
 
-    ``native`` and ``exllamav3`` are intentionally returned as requested even
-    when their optional extension is absent.  The dispatch function then applies
-    the documented graceful fallback; this makes configuration introspection
-    deterministic and avoids importing CUDA extensions during config parsing.
+    ``native``, ``exllamav3`` and ``b12x`` are intentionally returned as
+    requested even when their optional extension is absent.  The dispatch
+    function then applies the documented graceful fallback; this makes
+    configuration introspection deterministic and avoids importing CUDA
+    extensions during config parsing.
     """
     requested = os.environ.get("VLLM_EXL3_MOE_KERNEL", "auto").strip().lower()
-    if requested not in {"native", "exllamav3", "auto"}:
+    if requested not in {"native", "exllamav3", "b12x", "auto"}:
         logger.warning(
             "Unknown VLLM_EXL3_MOE_KERNEL=%r; using auto selection", requested
         )
@@ -3504,6 +3552,20 @@ def apply_exl3_fused_moe(
     tokens, hidden = x2d.shape
     n_exp = len(inners)
 
+    if get_moe_kernel_backend() == "b12x":
+        try:
+            from . import b12x_moe as _b12x
+
+            b12x_out = _b12x.apply(
+                layer, x2d, ids, weights, expert_map, limit=limit
+            )
+        except Exception as exc:  # defensive: b12x_moe.apply does not raise
+            b12x_out = None
+            layer._exl3_b12x_error = repr(exc)
+        if b12x_out is not None:
+            layer._exl3_last_apply = "b12x"
+            return b12x_out
+
     # Keep this entry point independently usable by callers that bypass
     # ``apply_exl3_experts`` (for example, custom vLLM runners).
     if get_moe_kernel_backend() == "native":
@@ -4006,6 +4068,22 @@ def apply_exl3_experts(
     # unsupported shapes and launch failures fall through to the established
     # ExLlamaV3/Python implementations below.
     backend = get_moe_kernel_backend()
+    if backend == "b12x" and (fused is not False):
+        try:
+            from . import b12x_moe as _b12x
+
+            b12x_out = _b12x.apply(
+                layer, x2d, ids, weights, expert_map, limit=limit
+            )
+        except Exception as exc:  # the module never raises; belt and braces
+            b12x_out = None
+            layer._exl3_b12x_error = repr(exc)
+            getattr(logger, "warning_once", logger.warning)(
+                "b12x EXL3 MoE dispatch failed; falling back: %s", exc
+            )
+        if b12x_out is not None:
+            layer._exl3_last_apply = "b12x"
+            return b12x_out.to(dtype=x.dtype)
     if backend == "native" and (fused is not False):
         try:
             native_out = _apply_native_fused_moe(
@@ -5575,6 +5653,36 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                         f"EXL3 experts disagree on codebook: expert {e} {f_e} vs expert 0 {flags}"
                     )
             layer._exl3_codebook_flags = flags
+        # One-time b12x MoE preparation (VLLM_EXL3_MOE_KERNEL=b12x only): it
+        # wraps the live arenas zero-copy and materialises the [E,3I] per-expert
+        # intermediate rotations. Out-of-scope layers record why and keep their
+        # established dispatch.
+        try:
+            from . import b12x_moe as _b12x
+
+            if _b12x.requested():
+                _b12x.prepare_layer(layer)
+            elif not _B12X_PROBE.get("logged"):
+                # One line per process: says WHICH process decided "not b12x"
+                # and with what environment. The workers are where the answer
+                # matters, and their env is not visible from /proc (setproctitle
+                # rewrites the area), so the process itself has to report it.
+                _B12X_PROBE["logged"] = True
+                logger.info(
+                    "b12x probe: not requested in this process "
+                    "(VLLM_EXL3_MOE_KERNEL=%r, VLLM_EXL3_B12X_PATH=%r, "
+                    "vendor=%r, env_vars=%d)",
+                    os.environ.get("VLLM_EXL3_MOE_KERNEL"),
+                    os.environ.get("VLLM_EXL3_B12X_PATH"),
+                    _b12x._vendor_dir(),
+                    len(os.environ),
+                )
+        except Exception as exc:  # optional backend must never fail a load
+            layer._exl3_b12x_state = None
+            layer._exl3_b12x_error = repr(exc)
+            getattr(logger, "warning", logger.info)(
+                "b12x MoE layer preparation failed: %s", exc
+            )
         fused_ok = False
         fused_err = None
         # Fused/native MoE launches take a single K for gate/up/down across the
@@ -5714,6 +5822,12 @@ class Exl3MoEMethod(FusedMoEMethodBase):
                 "EXL3 MoE trace [%s]: native_err=%r",
                 _cls,
                 getattr(layer, "_exl3_native_error", None),
+            )
+            logger.info(
+                "EXL3 MoE trace [%s]: b12x_state=%s b12x_err=%r",
+                _cls,
+                getattr(layer, "_exl3_b12x_state", None) is not None,
+                getattr(layer, "_exl3_b12x_error", None),
             )
         return out
 
