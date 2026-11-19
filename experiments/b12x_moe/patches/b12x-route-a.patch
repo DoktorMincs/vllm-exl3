@@ -1,0 +1,425 @@
+diff --git a/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py b/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
+index 406dd7233..23e5d70aa 100644
+--- a/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
++++ b/flashinfer/experimental/b12x/_lib/intrinsics/trellis.py
+@@ -166,6 +166,116 @@ def packed_decode_trellis_mul1_e4m3_to_e4m3x8(
+     return Uint32(lo), Uint32(hi)
+ 
+ 
++@dsl_user_op
++def packed_dequant_trellis_mul1_to_half2x4(
++    win_a, win_b, bits: int = 3, *, loc=None, ip=None
++):
++    """Decode eight MUL1 lanes straight to fp16, bit-faithful to ExLlamaV3.
++
++    ExLlamaV3 ``codebook.cuh`` (``cb == 2``) computes, per weight::
++
++        sum = dp4a(win * 0x83DCD12D, 0x01010101, 0x6400)   # 1024..2047
++        h   = (half)(uint16)sum
++        v   = __hfma(h, 0x1eee, 0xc931)                    # fp16 ramp
++
++    ``packed_decode_trellis_mul1_e4m3_to_e4m3x8`` runs the same sequence but
++    ends in ``cvt.rn.satfinite.e4m3x2.f16x2``, which rounds the value to E4M3.
++    That rounding is part of the E4M3 reconstruction law, not of the fp16 one:
++    over the full ramp it costs up to 0.125 absolute (~2.6% relative L2), so a
++    W4A16 kernel decoding fp16 weights must not reuse it.  This primitive is
++    that sequence minus the conversion, so its output is the EXL3 law exactly.
++
++    Lane order matches ``packed_dequant_trellis_to_half2x4``:
++      o0=(w0,w1) o1=(w2,w3) o2=(w4,w5) o3=(w6,w7),
++    with w7..w4 from ``win_a`` and w3..w0 from ``win_b``.
++    """
++    bits = int(bits)
++    if bits not in (2, 3, 4):
++        raise ValueError(
++            f"unsupported MUL1 trellis bitrate {bits}; expected 2, 3, or 4"
++        )
++    asm = """
++        {
++            .reg .b32 w0,w1,w2,w3,w4,w5,w6,w7;
++            .reg .b32 h01,h23,h45,h67, M, ones, acc, kinv, kbias;
++            mov.b32 M, __MUL1__;
++            mov.b32 ones, 0x01010101;
++            mov.b32 acc, 0x00006400;
++            mov.b32 kinv, 0x1eee1eee;
++            mov.b32 kbias, 0xc931c931;
++            and.b32 w7, $4, 0xffff;
++            shr.u32 w6, $4, __B1__;  and.b32 w6, w6, 0xffff;
++            shr.u32 w5, $4, __B2__;  and.b32 w5, w5, 0xffff;
++            shr.u32 w4, $4, __B3__;  and.b32 w4, w4, 0xffff;
++            and.b32 w3, $5, 0xffff;
++            shr.u32 w2, $5, __B1__;  and.b32 w2, w2, 0xffff;
++            shr.u32 w1, $5, __B2__;  and.b32 w1, w1, 0xffff;
++            shr.u32 w0, $5, __B3__;  and.b32 w0, w0, 0xffff;
++            mul.lo.u32 w0, w0, M;  dp4a.u32.u32 w0, w0, ones, acc;
++            mul.lo.u32 w1, w1, M;  dp4a.u32.u32 w1, w1, ones, acc;
++            mul.lo.u32 w2, w2, M;  dp4a.u32.u32 w2, w2, ones, acc;
++            mul.lo.u32 w3, w3, M;  dp4a.u32.u32 w3, w3, ones, acc;
++            mul.lo.u32 w4, w4, M;  dp4a.u32.u32 w4, w4, ones, acc;
++            mul.lo.u32 w5, w5, M;  dp4a.u32.u32 w5, w5, ones, acc;
++            mul.lo.u32 w6, w6, M;  dp4a.u32.u32 w6, w6, ones, acc;
++            mul.lo.u32 w7, w7, M;  dp4a.u32.u32 w7, w7, ones, acc;
++            prmt.b32 h01, w0, w1, 0x5410;
++            prmt.b32 h23, w2, w3, 0x5410;
++            prmt.b32 h45, w4, w5, 0x5410;
++            prmt.b32 h67, w6, w7, 0x5410;
++            fma.rn.f16x2 h01, h01, kinv, kbias;
++            fma.rn.f16x2 h23, h23, kinv, kbias;
++            fma.rn.f16x2 h45, h45, kinv, kbias;
++            fma.rn.f16x2 h67, h67, kinv, kbias;
++            mov.b32 $0, h01;
++            mov.b32 $1, h23;
++            mov.b32 $2, h45;
++            mov.b32 $3, h67;
++        }
++        """
++    asm = (
++        asm.replace("__MUL1__", f"{_TRELLIS_MUL1:#010x}")
++        .replace("__B1__", str(bits))
++        .replace("__B2__", str(2 * bits))
++        .replace("__B3__", str(3 * bits))
++    )
++    result = llvm.inline_asm(
++        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32(), T.i32()]),
++        [
++            Uint32(win_a).ir_value(loc=loc, ip=ip),
++            Uint32(win_b).ir_value(loc=loc, ip=ip),
++        ],
++        asm,
++        "=r,=r,=r,=r,r,r",
++        has_side_effects=False,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++    o0 = llvm.extractvalue(T.i32(), result, [0], loc=loc, ip=ip)
++    o1 = llvm.extractvalue(T.i32(), result, [1], loc=loc, ip=ip)
++    o2 = llvm.extractvalue(T.i32(), result, [2], loc=loc, ip=ip)
++    o3 = llvm.extractvalue(T.i32(), result, [3], loc=loc, ip=ip)
++    return Uint32(o0), Uint32(o1), Uint32(o2), Uint32(o3)
++
++
++@dsl_user_op
++def packed_dequant_trellis_mul1_to_bfloat2x4(
++    win_a, win_b, bits: int = 3, *, loc=None, ip=None
++):
++    """Diagnostic bf16 conversion of the fp16 MUL1 decode."""
++    h0, h1, h2, h3 = packed_dequant_trellis_mul1_to_half2x4(
++        win_a, win_b, bits, loc=loc, ip=ip
++    )
++    return (
++        _f16x2_to_bf16x2(h0, loc=loc, ip=ip),
++        _f16x2_to_bf16x2(h1, loc=loc, ip=ip),
++        _f16x2_to_bf16x2(h2, loc=loc, ip=ip),
++        _f16x2_to_bf16x2(h3, loc=loc, ip=ip),
++    )
++
++
+ @dsl_user_op
+ def packed_decode_lut_e4m3_to_e4m3x8(
+     win_a,
+diff --git a/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py b/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
+index 7b1a3768c..d1bf3a8fa 100644
+--- a/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
++++ b/flashinfer/experimental/b12x/gemm/trellis_linear/_preparation.py
+@@ -17,6 +17,7 @@ from b12x.preparation import (
+     current_plan,
+ )
+ from b12x.moe._shared.kernels.w4a16.prepare import PreparedTrellis256DenseWeight
++from b12x.moe._shared.trellis_codebooks import is_lut_free
+ from ._tuning import TUNING, TrellisConfig, TrellisQuery
+ 
+ _INTERNAL_C_TMPS = weakref.WeakValueDictionary()
+@@ -126,7 +127,7 @@ def _c_tmp_elements(query: TrellisQuery, config: TrellisConfig, sm_count: int) -
+ 
+ 
+ def _lut_memory(query: TrellisQuery, device) -> PersistentMemory | None:
+-    if query.codebook == "mcg":
++    if is_lut_free(query.codebook):
+         return None
+     resolved = torch.device("cuda", device.ordinal)
+     if query.codebook == "lut_e4m3":
+diff --git a/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py b/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
+index fba9bc2b3..ce9229cd0 100644
+--- a/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
++++ b/flashinfer/experimental/b12x/gemm/trellis_linear/_tuning.py
+@@ -101,10 +101,14 @@ def validate_query(query):
+     if query.pair_kind != pair_kind.upper() or query.rate_axis != rate_axis:
+         raise ValueError("Trellis pair layout and explicit pair/rate metadata differ")
+     size = query.in_features if rate_axis == "k" else query.out_features
+-    if query.bits != 3 or size != 256 or query.codebook not in ("mcg", "lut_e4m3"):
++    if query.bits != 3 or size != 256 or query.codebook not in (
++        "mcg",
++        "mul1",
++        "lut_e4m3",
++    ):
+         raise ValueError(
+             "compact Trellis pairs require three stored bits per weight, a 256-channel "
+-            "rate axis, and the mcg or lut_e4m3 codebook"
++            "rate axis, and the mcg, mul1, or lut_e4m3 codebook"
+         )
+ 
+ 
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
+index 42148f003..fc1c82213 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/config.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ from b12x._lib.quant.block_codec import BLOCK_CODECS
+ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+ from b12x.moe._shared.trellis_codebooks import LUT_FP16
++from b12x.moe._shared.trellis_codebooks import MUL1
+ from b12x.moe._shared.trellis_codebooks import MCG
+ from cutlass.cutlass_dsl import T
+ from cutlass.cutlass_dsl import Uint32
+@@ -152,7 +153,7 @@ _TRELLIS256_W13_LAYOUTS = {"packed", "trellis_t256_proj"}
+ # bitrate. Their exact storage is [16*bits] int16 == [8*bits] uint32 per tile.
+ _TRELLIS256_BITS = (2, 3, 4, 5, 6)
+ 
+-_TRELLIS256_CODEBOOKS = {MCG, LUT_E4M3, LUT_FP16}
++_TRELLIS256_CODEBOOKS = {MCG, MUL1, LUT_E4M3, LUT_FP16}
+ 
+ _LUT_E4M3_VALUE_TABLE_ENTRIES = 1 << 12
+ 
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
+index 6b53b4fb0..406b06ae9 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ from b12x._lib.quant.block_codec import BLOCK_CODECS
+ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
++from b12x.moe._shared.trellis_codebooks import is_lut_free
+ from b12x.moe._shared.kernels.w4a16.route_pack import (
+     pack_topk_routes_by_expert as _pack_topk_routes_by_expert,
+ )
+@@ -405,7 +406,7 @@ def _run_trellis256_dense_current_device(
+     tile_n = int(launch.kernel.tile_n)
+     n_tiles = size_n // tile_n
+     grid_x = min(int(grid_cap), max(route_blocks * n_tiles, 1))
+-    if trellis_codebook != "mcg" and execution_lut is None:
++    if not is_lut_free(trellis_codebook) and execution_lut is None:
+         raise ValueError("prepared Trellis decoder is missing its execution LUT")
+     stream = current_cuda_stream() if stream is None else stream
+     dummy_i32 = prepared_dense.workspace[:1]
+@@ -437,8 +438,8 @@ def _run_trellis256_dense_current_device(
+         prepared_dense.global_scale,
+         launch.c_tmp,
+         prepared_dense.workspace,
+-        # MCG kernels never dereference the LUT ABI slot.
+-        dummy_i32 if trellis_codebook == "mcg" else execution_lut,
++        # Register-only decoders (MCG/MUL1) never dereference the LUT ABI slot.
++        dummy_i32 if is_lut_free(trellis_codebook) else execution_lut,
+         m,
+         grid_x,
+         stream,
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
+index 9425e6071..817f9bdd2 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused.py
+@@ -286,10 +286,20 @@ class W4A16FusedMoeKernel:
+                 raise ValueError(
+                     "intermediate_rotation is only supported for trellis_t256"
+                 )
+-            if not is_gated or self.activation_is_swigluoai or self.has_swiglu_limit:
++            # LOCAL PATCH (EXL3): the swiglu limit is supported on this path.
++            # The rotation-aware epilogue clamps the *effective* gate/up (after
++            # had128 and svh, which is the value the EXL3 reference loop clamps
++            # and feeds to silu), so gated silu with a limit is well defined
++            # here; swiglu-oai has its own alpha/beta law and situ is only
++            # implemented unclamped in this branch.
++            if (
++                not is_gated
++                or self.activation_is_swigluoai
++                or (self.activation_is_situ and self.has_swiglu_limit)
++            ):
+                 raise ValueError(
+-                    "intermediate_rotation requires unclamped gated silu or situ "
+-                    "(no swiglu limit/oai)"
++                    "intermediate_rotation requires gated silu (clamped or "
++                    "unclamped) or unclamped situ (no swiglu-oai)"
+                 )
+             if int(intermediate_size) % 128 != 0:
+                 raise ValueError(
+@@ -2415,6 +2425,14 @@ class W4A16FusedMoeKernel:
+                 iu2_1 = uh1 * svu1
+                 iu2_2 = uh2 * svu2
+                 iu2_3 = uh3 * svu3
++                if cutlass.const_expr(self.has_swiglu_limit):
++                    # LOCAL PATCH (EXL3): DS4.1's clamp law, applied where the
++                    # model defines it -- on the effective gate/up (post svh),
++                    # gate clamped from above and up symmetrically, before silu.
++                    ig2_0, iu2_0 = self._clamp_swiglu_inputs(ig2_0, iu2_0)
++                    ig2_1, iu2_1 = self._clamp_swiglu_inputs(ig2_1, iu2_1)
++                    ig2_2, iu2_2 = self._clamp_swiglu_inputs(ig2_2, iu2_2)
++                    ig2_3, iu2_3 = self._clamp_swiglu_inputs(ig2_3, iu2_3)
+                 # silu(gate) * up, then pre-scale suh_down
+                 d2 = isz + isz
+                 sd0 = rot_scales_flat[s_base + d2 + Int32(0)].to(cutlass.Float32)
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
+index 12057f9b8..f0f3e4aa4 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/fused_launch.py
+@@ -8,6 +8,7 @@ from cutlass.cutlass_dsl import Int32
+ from cutlass.cutlass_dsl import Int64
+ from b12x._lib.compiler import KernelCompileSpec
+ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
++from b12x.moe._shared.trellis_codebooks import is_lut_free
+ from cutlass.base_dsl.compiler import OptLevel
+ from b12x._lib.compile_plan import attach_programs
+ from b12x._lib.compiler import compile as b12x_compile
+@@ -998,7 +999,7 @@ def _w4a16_fused_moe_launch_flat(
+         )
+         fc1_trellis_lut_addr = iq2_lut.data_ptr()
+         fc2_trellis_lut_addr = iq2_lut.data_ptr()
+-    elif weight_layout == "trellis_t256" and trellis_codebook != "mcg":
++    elif weight_layout == "trellis_t256" and not is_lut_free(trellis_codebook):
+         trellis_rank_lut = _trellis256_execution_lut(
+             a_input.device, trellis_codebook, direct_lut=fused.trellis_direct_lut
+         )
+diff --git a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
+index 36c4aff7d..c18a3ca15 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
++++ b/flashinfer/experimental/b12x/moe/_shared/kernels/w4a16/kernel/gemm.py
+@@ -7,6 +7,7 @@ from cutlass.cutlass_dsl import Int32
+ from cutlass.cutlass_dsl import Int64
+ from b12x.moe._shared.trellis_codebooks import LUT_E4M3
+ from b12x.moe._shared.trellis_codebooks import LUT_FP16
++from b12x.moe._shared.trellis_codebooks import MUL1
+ from cutlass.cutlass_dsl import Uint32
+ from b12x.moe._shared.kernels.trellis_ring import (
+     trellis256_lane_geom_bits as _trellis_ring_lane_geom_bits,
+@@ -59,6 +60,8 @@ from b12x._lib.intrinsics.packed import packed_dequant_e4m3x4_to_bfloat2x2
+ from b12x._lib.intrinsics.packed import packed_dequant_e4m3x4_to_half2x2
+ from b12x._lib.intrinsics.packed import packed_dequant_e8m0x4_to_bfloat2x2
+ from b12x._lib.intrinsics.packed import packed_dequant_e8m0x4_to_half2x2
++from b12x._lib.intrinsics.trellis import packed_dequant_trellis_mul1_to_bfloat2x4
++from b12x._lib.intrinsics.trellis import packed_dequant_trellis_mul1_to_half2x4
+ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_stream_to_bfloat2x4
+ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_stream_to_half2x4
+ from b12x._lib.intrinsics.trellis import packed_dequant_trellis_to_bfloat2x4
+@@ -3547,6 +3550,15 @@ class W4A16GemmKernel:
+                 o0, o1, o2, o3 = packed_dequant_trellis_to_bfloat2x4(
+                     win_a, win_b, int(bits)
+                 )
++        elif cutlass.const_expr(self.trellis_codebook == MUL1):
++            if cutlass.const_expr(self.is_fp16):
++                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_half2x4(
++                    win_a, win_b, bits
++                )
++            else:
++                o0, o1, o2, o3 = packed_dequant_trellis_mul1_to_bfloat2x4(
++                    win_a, win_b, bits
++                )
+         elif cutlass.const_expr(self.trellis_codebook == LUT_FP16):
+             if cutlass.const_expr(self.is_fp16):
+                 o0, o1, o2, o3 = packed_decode_lut_fp16_to_half2x4(
+diff --git a/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py b/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
+index df9b14a39..dfaae9c97 100644
+--- a/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
++++ b/flashinfer/experimental/b12x/moe/_shared/trellis_codebooks.py
+@@ -2,10 +2,13 @@
+ 
+ A ``trellis_t256`` tile stores 256 tail-biting codes whose 16-bit decode
+ windows are interpreted by one codebook. The codebook is a model-level
+-setting; three are defined:
++setting; four are defined:
+ 
+ - ``mcg``: multiplicative congruential decode (multiplier ``0xCBAC1FED``)
+   with a lop3 mask/or into two added fp16 halves.
++- ``mul1``: multiplicative decode with multiplier ``0x83DCD12D`` followed by a
++  four-byte sum and one FP16 affine step (ExLlamaV3 ``codebook.cuh`` cb==2);
++  defined for K2/K3/K4.
+ - ``lut_e4m3``: integer permutation of each decode window followed by a
+   fixed E4M3 value table; defined for K2/K3/K4.
+ - ``lut_fp16``: integer permutation followed by a piecewise-linear FP16 value
+@@ -18,13 +21,28 @@ constants, so the ids participate in kernel cache keys.
+ from __future__ import annotations
+ 
+ MCG = "mcg"
++MUL1 = "mul1"
+ LUT_E4M3 = "lut_e4m3"
+ LUT_FP16 = "lut_fp16"
+ 
+-CODEBOOKS: tuple[str, ...] = (MCG, LUT_E4M3, LUT_FP16)
++CODEBOOKS: tuple[str, ...] = (MCG, MUL1, LUT_E4M3, LUT_FP16)
+ 
+ MCG_MULTIPLIER = 0xCBAC1FED
+-CODEBOOK_SENTINELS: dict[int, str] = {MCG_MULTIPLIER: MCG}
++MUL1_MULTIPLIER = 0x83DCD12D
++CODEBOOK_SENTINELS: dict[int, str] = {
++    MCG_MULTIPLIER: MCG,
++    MUL1_MULTIPLIER: MUL1,
++}
++
++# Codebooks whose decode is a register-only arithmetic law: they never read an
++# execution LUT, so kernels take the empty LUT slot instead of staging one.
++LUT_FREE_CODEBOOKS: frozenset[str] = frozenset((MCG, MUL1))
++
++
++def is_lut_free(codebook: str) -> bool:
++    """True when ``codebook`` decodes without an execution value table."""
++
++    return codebook in LUT_FREE_CODEBOOKS
+ 
+ 
+ def normalize_codebook(codebook: str | int) -> str:
+@@ -39,7 +57,8 @@ def normalize_codebook(codebook: str | int) -> str:
+         if normalized is None:
+             raise ValueError(
+                 "unsupported trellis codebook sentinel "
+-                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected MCG 0xcbac1fed"
++                f"{int(codebook) & 0xFFFFFFFF:#010x}; expected MCG 0xcbac1fed "
++                "or MUL1 0x83dcd12d"
+             )
+         return normalized
+     text = str(codebook).strip().lower()
+@@ -47,17 +66,19 @@ def normalize_codebook(codebook: str | int) -> str:
+         return text
+     raise ValueError(
+         f"unsupported trellis codebook {codebook!r}; expected "
+-        "'mcg', 'lut_e4m3', or 'lut_fp16'"
++        "'mcg', 'mul1', 'lut_e4m3', or 'lut_fp16'"
+     )
+ 
+ 
+ def validate_codebook_bits(codebook: str, bits: int) -> None:
+     """Reject (codebook, bitrate) pairs the decoders do not define.
+ 
+-    MCG decodes any supported tile bitrate; the lookup-table codebooks are
+-    defined only on their construction ranges.
++    MCG decodes any supported tile bitrate; the lookup-table and MUL1 codebooks
++    are defined only on their construction ranges.
+     """
+ 
++    if codebook == MUL1 and bits not in (2, 3, 4):
++        raise ValueError("mul1 is defined only for K2/K3/K4")
+     if codebook == LUT_E4M3 and bits not in (2, 3, 4):
+         raise ValueError("lut_e4m3 is defined only for K2/K3/K4")
+     if codebook == LUT_FP16 and bits not in (5, 6):
+diff --git a/flashinfer/experimental/b12x/moe/fused_moe/config.py b/flashinfer/experimental/b12x/moe/fused_moe/config.py
+index 6745af9dc..88fc8774a 100644
+--- a/flashinfer/experimental/b12x/moe/fused_moe/config.py
++++ b/flashinfer/experimental/b12x/moe/fused_moe/config.py
+@@ -9,6 +9,7 @@ from typing import Any, Mapping
+ 
+ class TrellisCodebook(str, Enum):
+     MCG = "mcg"
++    MUL1 = "mul1"
+     LUT_E4M3 = "lut_e4m3"
+     LUT_FP16 = "lut_fp16"
+ 
+diff --git a/flashinfer/experimental/b12x/moe/fused_moe/trellis.py b/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
+index 366362003..9a1c0a669 100644
+--- a/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
++++ b/flashinfer/experimental/b12x/moe/fused_moe/trellis.py
+@@ -309,6 +309,8 @@ def _symmetric_bits(
+         allowed = (uniform_bits,)
+     elif config.codebook is TrellisCodebook.MCG:
+         allowed = (3, 4, 5)
++    elif config.codebook is TrellisCodebook.MUL1:
++        allowed = (2, 3, 4)
+     elif config.codebook is TrellisCodebook.LUT_E4M3:
+         allowed = (3,)
+     else:
