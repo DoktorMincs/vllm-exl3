@@ -118,7 +118,7 @@ def _vendor_dir() -> str | None:
                     return cand
             return raw
     for cand in (
-        "/root/b12x-vendor",
+        os.path.expanduser("~/b12x-vendor"),
         os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
             "third_party",

@@ -18,7 +18,7 @@ What the patch adds:
   4 sites that enumerate them, and the joint gate/up projection-major layout.
 
 Apply from the directory that *contains* the `b12x` package (for this host,
-`/root/b12x-vendor`, or whatever `VLLM_EXL3_B12X_PATH` points at):
+`~/b12x-vendor`, or whatever `VLLM_EXL3_B12X_PATH` points at):
 
 ```bash
 git apply -p3 /path/to/b12x-route-a.patch
@@ -27,7 +27,8 @@ git apply -p3 /path/to/b12x-route-a.patch
 
 Verify against an already-patched tree with
 `git apply -R --check -p3 b12x-route-a.patch` (this is how the copy in this
-repo was checked: it matches `/root/b12x-vendor/b12x` exactly).
+repo was checked: it matches the vendor tree under `~/b12x-vendor/b12x`
+exactly).
 
 Measured on the DS41 mia-v1 pack (TP2xPP5, 512k): routed-expert prefill
 1.57–1.72x the fused `exl3_moe`, decode unchanged (the backend only takes
